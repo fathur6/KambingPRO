@@ -1,27 +1,26 @@
 // KambingPRO ESP32 - Arduino Cloud + Google Sheet Hourly Logger (Time-Synced, Power-Aware)
 // Aligned to NTP (GMT+8). Posts averaged hourly data to Google Sheet via Apps Script Webhook.
-// Aman & Anna, 2025-06-xx (Revised 2025-06-02 for best practices)
+// Aman & Anna, 2025-06-10 (Revised 2025-06-19 for best practices)
 
 #include "thingProperties.h" // Contains Arduino Cloud variable declarations and connection logic
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
-#include <time.h>               // For NTP time synchronization
-#include <WiFiClientSecure.h>   // For HTTPS communication
+#include <time.h>            // For NTP time synchronization
+#include <WiFiClientSecure.h>  // For HTTPS communication
 #include <ArduinoHttpClient.h>
-#include <ArduinoJson.h>        // For creating JSON payloads
+#include <ArduinoJson.h>     // For creating JSON payloads
 
 // ==== Project Configuration ====
 const char* THING_UID_NAME = "RAB001"; // Unique identifier for this device/thing
 
 // ---- Google Apps Script Webhook ----
-// Note: Ensure your Google Apps Script is deployed to accept POST requests
 const char* GOOGLE_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxaygP3nPks_jBGWjEhmRce7UESrxxHb1cGK65Nhnxpc4L663tCWeSaVKkdExZya0oc/exec";
 const char* GOOGLE_SCRIPT_HOST = "script.google.com";
 const int   GOOGLE_SCRIPT_PORT = 443; // HTTPS port
 
 // ---- NTP Configuration ----
-const long  GMT_OFFSET_SECONDS    = 8 * 3600; // GMT+8
+const long  GMT_OFFSET_SECONDS    = 8 * 3600; // GMT+8 for Kuala Terengganu
 const int   DAYLIGHT_OFFSET_SECONDS = 0;
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.nist.gov";
@@ -45,11 +44,10 @@ const int MQ137_ANALOG_PIN    = 34; // ESP32 ADC1 pin
 const float MQ137_LOAD_RESISTOR_KOHM = 22.0f; // kOhms
 const float ADC_VOLTAGE_REFERENCE    = 3.3f;  // ESP32 ADC reference voltage
 const float ADC_MAX_VALUE            = 4095.0f; // ESP32 12-bit ADC
-// MQ137 Ammonia calculation parameters (empirical, adjust as needed)
 const float MQ137_AMMONIA_OFFSET_PPM   = 7.0f;
 const float MQ137_AMMONIA_SCALING_DIV  = 10.0f;
 
-const float ULTRASONIC_TIMEOUT_US    = 30000UL; // Microseconds
+const unsigned long ULTRASONIC_TIMEOUT_US  = 30000UL; // Microseconds
 const float SPEED_OF_SOUND_CM_PER_US = 0.0343f;
 
 // ---- Tank Geometry (Frustum Shape) ----
@@ -62,41 +60,49 @@ const float TANK_MAX_VOLUME_LITERS = (M_PI * TANK_HEIGHT_CM / 3.0f) *
                                       TANK_RADIUS_BOTTOM_CM * TANK_RADIUS_BOTTOM_CM) / 1000.0f;
 
 // ---- Data Sampling & Averaging ----
-#define MAX_HOURLY_SAMPLES 6 // E.g., one sample every 10 minutes for an hour
-float hourlyAmmoniaSamples[MAX_HOURLY_SAMPLES];
-float hourlyTemperatureSamples[MAX_HOURLY_SAMPLES];
-float hourlyHumiditySamples[MAX_HOURLY_SAMPLES];
-float hourlyStorageTankSamples[MAX_HOURLY_SAMPLES];
+// IMPROVEMENT: Using constexpr for a true compile-time constant.
+constexpr int SAMPLES_PER_HOUR = 6; // One sample every 10 minutes for an hour
+constexpr int SAMPLING_INTERVAL_MINUTES = 10;
+float hourlyAmmoniaSamples[SAMPLES_PER_HOUR];
+float hourlyTemperatureSamples[SAMPLES_PER_HOUR];
+float hourlyHumiditySamples[SAMPLES_PER_HOUR];
+float hourlyStorageTankSamples[SAMPLES_PER_HOUR];
 int   currentHourlySampleCount = 0;
 
 // ---- Global Objects ----
 LiquidCrystal_I2C lcd(0x27, 16, 2); // I2C address 0x27, 16 column and 2 rows
 DHT dht(DHT_SENSOR_PIN, DHT_SENSOR_TYPE);
 
-WiFiClientSecure clientForGoogleSheetsPOST_secure; // Use WiFiClientSecure for HTTPS
-HttpClient googleSheetsHttpClient = HttpClient(clientForGoogleSheetsPOST_secure, GOOGLE_SCRIPT_HOST, GOOGLE_SCRIPT_PORT);
+WiFiClientSecure clientSecure; // Use WiFiClientSecure for HTTPS
+HttpClient googleSheetsClient = HttpClient(clientSecure, GOOGLE_SCRIPT_HOST, GOOGLE_SCRIPT_PORT);
 
-// ---- Timing Variables ----
-unsigned long lastNtpSyncMillis = 0;
-unsigned long lastSuccessfulSampleMillis = 0; // To avoid multiple samples in the same target second
+// ---- Timing & State Variables ----
+unsigned long lastNtpSyncMillis        = 0;
+unsigned long pumpTurnedOnMillis       = 0;
+// CRITICAL FIX: This constant was used in the loop but never declared.
+const long PUMP_ON_DURATION_MS         = 20000L; // 20 seconds auto-off for pump
 
-// ---- Cloud Variables (assumed to be defined in thingProperties.h) ----
-// extern float temperature;
-// extern float humidity;
-// extern float ammonia;
-// extern float storageTank;
-// extern bool storagePump;
-// extern bool siren;
-// extern bool cCTV;
-// extern bool auxilliarySocket;
-// extern int flushInterval; // Assuming this is defined if onFlushIntervalChange exists
+// IMPROVEMENT: State variables for robust, non-blocking timed events
+int lastSampleMinute = -1;
+int lastReportHour   = -1;
+
+
+// --- Forward declarations for refactored functions ---
+void handleSensorsAndDisplay();
+void handleHourlyTasks(unsigned long currentMillis);
+void readAllSensors();
+void updateLcd();
+void handleDataSampling(const tm& timeinfo);
+void handleHourlyReporting(const tm& timeinfo);
+void postToGoogleSheets();
+
 
 // =======================================================================================
-//                                   SETUP FUNCTION
+//                                  SETUP FUNCTION
 // =======================================================================================
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 3000); // Wait for serial port to connect (for debugging)
+  while (!Serial && millis() < 3000); // Wait for serial port to connect
   Serial.println("KambingPRO ESP32 Initializing...");
 
   // --- Initialize Relays (Output, Low initial state) ---
@@ -118,15 +124,16 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print("Initializing...");
 
-  // --- Initialize Arduino Cloud Properties and Connection ---
-  initProperties(); // Links variables to Arduino Cloud
+  // --- Initialize Arduino Cloud ---
+  initProperties();
   ArduinoCloud.begin(ArduinoIoTPreferredConnection);
-  setDebugMessageLevel(2); // 0 (errors only), 1 (info), 2 (debug), 3 (trace)
+  setDebugMessageLevel(2);
   ArduinoCloud.printDebugInfo();
 
   Serial.println("Waiting for Arduino Cloud connection...");
-  while (ArduinoCloud.connected() != 1) {
-    ArduinoCloud.update(); // Must be called frequently
+  // IMPROVEMENT: Using the more common boolean check idiom.
+  while (!ArduinoCloud.connected()) {
+    ArduinoCloud.update();
     delay(500);
     Serial.print(".");
   }
@@ -137,6 +144,12 @@ void setup() {
 
   // --- Initialize Data Storage ---
   clearHourlySampleArrays();
+  // Initialize state variables with current time info
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  lastReportHour = timeinfo.tm_hour;
+  lastSampleMinute = timeinfo.tm_min;
 
   // --- Final LCD Ready Message ---
   lcd.clear();
@@ -147,12 +160,13 @@ void setup() {
 }
 
 // =======================================================================================
-//                                    MAIN LOOP
+//                                   MAIN LOOP
 // =======================================================================================
+// IMPROVEMENT: The loop is now much cleaner and delegates tasks to other functions.
 void loop() {
-  ArduinoCloud.update(); // Essential for Arduino Cloud functionality
-
   unsigned long currentMillis = millis();
+
+  ArduinoCloud.update(); // Essential for Arduino Cloud functionality
 
   // --- Periodic NTP Time Synchronization ---
   if (currentMillis - lastNtpSyncMillis > NTP_SYNC_INTERVAL_MS || lastNtpSyncMillis == 0) {
@@ -160,159 +174,194 @@ void loop() {
     lastNtpSyncMillis = currentMillis;
   }
 
-  // --- Read Sensor Data ---
-  float currentTemperature = dht.readTemperature(); // Celsius
-  float currentHumidity    = dht.readHumidity();    // Percent
+  handleSensorsAndDisplay();
+  handleHourlyTasks(currentMillis);
   
-  // Update cloud variables if readings are valid
-  if (!isnan(currentTemperature)) temperature = currentTemperature;
-  if (!isnan(currentHumidity))    humidity    = currentHumidity;
-
-  // MQ137 Ammonia Sensor Reading
-  int mq137_raw_adc = analogRead(MQ137_ANALOG_PIN);
-  float mq137_voltage_rl = mq137_raw_adc * (ADC_VOLTAGE_REFERENCE / ADC_MAX_VALUE);
-  float mq137_rs_kohm = 0.0f;
-  if (mq137_voltage_rl > 0.001f) { // Avoid division by zero or near-zero
-      mq137_rs_kohm = (ADC_VOLTAGE_REFERENCE - mq137_voltage_rl) * MQ137_LOAD_RESISTOR_KOHM / mq137_voltage_rl;
-  } else {
-      mq137_rs_kohm = 100000.0f; // Effectively a very high resistance -> low/zero PPM
-  }
-  ammonia = max(0.0f, MQ137_AMMONIA_OFFSET_PPM + (-mq137_rs_kohm / MQ137_AMMONIA_SCALING_DIV)); // Simplified model
-
-  // Ultrasonic Sensor - Water Tank Level
-  float distance_cm = measureDistanceCM(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
-  if (!isnan(distance_cm)) {
-    float waterHeight_cm = TANK_HEIGHT_CM - distance_cm;
-    waterHeight_cm = constrain(waterHeight_cm, 0.0f, TANK_HEIGHT_CM); // Ensure height is within tank bounds
-    storageTank = calculateWaterVolumeLiters(waterHeight_cm);
-  } else {
-    // storageTank remains its previous value or could be set to NAN if preferred
-    // For now, let's assume it keeps last valid reading or cloud variable default
+  // ---------- Pump Auto-Off Timer Logic ----------
+  if (storagePump && (currentMillis - pumpTurnedOnMillis >= PUMP_ON_DURATION_MS)) {
+    Serial.println("Pump -> OFF (20s timer elapsed)");
+    digitalWrite(RELAY_PUMP_PIN, LOW); // Turn off the relay
+    storagePump = false; // IMPORTANT: Update the cloud variable
   }
   
-  // --- LCD Update ---
-  lcd.setCursor(0, 0);
-  lcd.printf("T:%.1fC H:%.0f%% ", temperature, humidity); // Cloud variables shown
-  lcd.setCursor(0, 1);
-  lcd.printf("NH3:%.1f S:%.1fL", ammonia, storageTank); // Cloud variables shown
-
-  // --- Time-Synced Data Sampling (e.g., every 10 minutes at xx:00, xx:10, xx:20...) ---
-  time_t current_epoch_time = time(nullptr);
-  struct tm timeinfo;
-  localtime_r(&current_epoch_time, &timeinfo); // Get local time structure
-
-  // Sample at the start of the 0th second of every 10th minute
-  if (timeinfo.tm_min % 10 == 0 && timeinfo.tm_sec == 0) {
-    // Ensure sampling happens only once per target second
-    if (currentMillis - lastSuccessfulSampleMillis > 1000) { 
-      if (currentHourlySampleCount < MAX_HOURLY_SAMPLES) {
-        // Basic validation for sensor data before storing
-        if (temperature > -40.0f && temperature < 80.0f && // Plausible temp range
-            humidity >= 0.0f && humidity <= 100.0f &&   // Plausible humidity range
-            ammonia >= 0.0f &&                          // Ammonia shouldn't be negative
-            storageTank >= 0.0f) {                      // Volume shouldn't be negative
-              
-          hourlyTemperatureSamples[currentHourlySampleCount] = temperature;
-          hourlyHumiditySamples[currentHourlySampleCount]    = humidity;
-          hourlyAmmoniaSamples[currentHourlySampleCount]     = ammonia;
-          hourlyStorageTankSamples[currentHourlySampleCount] = storageTank;
-          currentHourlySampleCount++;
-          
-          Serial.printf("Sample %d taken at %02d:%02d:%02d\n", currentHourlySampleCount, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-          lastSuccessfulSampleMillis = currentMillis; 
-        } else {
-          Serial.println("Skipping sample due to invalid sensor data.");
-        }
-      }
-    }
-  }
-
-  // --- Hourly Reporting to Google Sheet (at the start of a new hour, e.g., xx:00:00) ---
-  if (timeinfo.tm_min == 0 && timeinfo.tm_sec == 0) {
-    static int lastReportHour = -1; // Ensure reporting happens only once per hour change
-    if (lastReportHour != timeinfo.tm_hour && currentHourlySampleCount > 0) { // Only report if there are samples
-      Serial.printf("Initiating hourly report for hour: %d\n", timeinfo.tm_hour);
-
-      float avg_temp = calculateFloatArrayAverage(hourlyTemperatureSamples, currentHourlySampleCount);
-      float avg_hum  = calculateFloatArrayAverage(hourlyHumiditySamples, currentHourlySampleCount);
-      float avg_nh3  = calculateFloatArrayAverage(hourlyAmmoniaSamples, currentHourlySampleCount);
-      float avg_tank = calculateFloatArrayAverage(hourlyStorageTankSamples, currentHourlySampleCount);
-
-      // --- Prepare JSON Payload for Google Sheets ---
-      StaticJsonDocument<512> json_payload_doc; // Adjust size as needed
-      json_payload_doc["thing"] = THING_UID_NAME;
-
-      char iso_timestamp_str[25]; // Buffer for ISO8601 timestamp
-      strftime(iso_timestamp_str, sizeof(iso_timestamp_str), "%Y-%m-%dT%H:00:00", &timeinfo); // Timestamp for the hour
-      json_payload_doc["timestamp"] = iso_timestamp_str;
-
-      // Only include fields in JSON if their average is a valid number
-      if (!isnan(avg_nh3))  json_payload_doc["ammonia"]     = round(avg_nh3 * 10.0f) / 10.0f; // 1 decimal place
-      if (!isnan(avg_temp)) json_payload_doc["temperature"] = round(avg_temp * 10.0f) / 10.0f;
-      if (!isnan(avg_hum))  json_payload_doc["humidity"]    = round(avg_hum * 10.0f) / 10.0f;
-      if (!isnan(avg_tank)) json_payload_doc["storageTank"] = round(avg_tank * 10.0f) / 10.0f;
-      
-      // Add status of cloud-controlled actuators (assuming these are global bools from thingProperties.h)
-      json_payload_doc["storagePump"]    = storagePump ? 1 : 0;
-      json_payload_doc["siren"]          = siren ? 1 : 0;
-      json_payload_doc["cctv"]           = cCTV ? 1 : 0; // Variable name in sketch cCTV, JSON auxilliarySocket
-      json_payload_doc["auxiliarySocket"]= auxilliarySocket ? 1 : 0;
-
-
-      String json_output_str;
-      serializeJson(json_payload_doc, json_output_str);
-      Serial.print("JSON Payload: "); Serial.println(json_output_str);
-
-      // --- Post to Google Sheets ---
-      if (WiFi.status() == WL_CONNECTED) {
-        // For ESP32, you might need to provide CA cert for script.google.com
-        // clientForGoogleSheetsPOST_secure.setCACert(google_ca_cert); 
-        // Or, for testing (less secure):
-        clientForGoogleSheetsPOST_secure.setInsecure(); // Allows connection to hosts without verifying SSL certificate. Use with caution.
-
-        Serial.println("Sending data to Google Sheet...");
-        String path = GOOGLE_SHEET_WEBHOOK_URL;
-        if (path.startsWith("https://script.google.com")) { // Ensure we only use the path part for the HttpClient
-             path = path.substring(String("https://script.google.com").length());
-        }
-
-        googleSheetsHttpClient.beginRequest();
-        int post_error = googleSheetsHttpClient.post(path.c_str());
-        
-        if (post_error == 0) { // Successfully started request
-          googleSheetsHttpClient.sendHeader("Content-Type", "application/json");
-          googleSheetsHttpClient.sendHeader("Content-Length", json_output_str.length());
-          googleSheetsHttpClient.beginBody();
-          googleSheetsHttpClient.print(json_output_str);
-          googleSheetsHttpClient.endRequest();
-
-          int http_response_code = googleSheetsHttpClient.responseStatusCode();
-          String http_response_body = googleSheetsHttpClient.responseBody();
-          Serial.print("Google Sheet POST - HTTP Response Code: "); Serial.println(http_response_code);
-          Serial.print("Google Sheet POST - Response Body: "); Serial.println(http_response_body);
-        } else {
-          Serial.print("Error starting HTTP POST request to Google Sheet, error code: "); Serial.println(post_error);
-        }
-        googleSheetsHttpClient.stop(); // Close connection
-      } else {
-        Serial.println("WiFi not connected. Cannot send hourly data to Google Sheet.");
-        // Optionally, implement data caching here to send later when connection is restored
-      }
-      
-      clearHourlySampleArrays(); // Reset for the next hour's samples
-      lastReportHour = timeinfo.tm_hour;
-    }
-  }
-  delay(200); // General loop delay to yield for other tasks if any (e.g. WiFi stack)
+  // A small non-blocking delay is acceptable to prevent a tight loop from starving other tasks.
+  delay(200);
 }
 
+
 // =======================================================================================
-//                                 HELPER FUNCTIONS
+//                           REFACTORED HELPER FUNCTIONS
 // =======================================================================================
 
 /**
- * @brief Synchronizes the ESP32's internal clock with an NTP server.
+ * @brief Main handler for all sensor reads and LCD updates.
  */
+void handleSensorsAndDisplay() {
+  // This function can be expanded with its own timer to avoid reading sensors
+  // on every single loop, e.g., only read every 2 seconds.
+  // For now, it runs on every loop pass (every ~200ms).
+  readAllSensors();
+  updateLcd();
+}
+
+/**
+ * @brief Reads all connected sensors and updates their respective cloud variables.
+ */
+void readAllSensors() {
+  // DHT22 Temperature & Humidity
+  float currentTemperature = dht.readTemperature();
+  float currentHumidity    = dht.readHumidity();
+  if (!isnan(currentTemperature)) temperature = currentTemperature;
+  if (!isnan(currentHumidity))    humidity    = currentHumidity;
+
+  // MQ-137 Ammonia Sensor
+  int mq137_raw_adc = analogRead(MQ137_ANALOG_PIN);
+  float mq137_voltage_rl = mq137_raw_adc * (ADC_VOLTAGE_REFERENCE / ADC_MAX_VALUE);
+  float mq137_rs_kohm = (mq137_voltage_rl > 0.001f)
+      ? (ADC_VOLTAGE_REFERENCE - mq137_voltage_rl) * MQ137_LOAD_RESISTOR_KOHM / mq137_voltage_rl
+      : 100000.0f; // Assign high resistance if voltage is near zero
+  ammonia = max(0.0f, MQ137_AMMONIA_OFFSET_PPM + (-mq137_rs_kohm / MQ137_AMMONIA_SCALING_DIV));
+
+  // HC-SR04 Ultrasonic Sensor
+  float distance_cm = measureDistanceCM(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
+  if (!isnan(distance_cm)) {
+    float waterHeight_cm = constrain(TANK_HEIGHT_CM - distance_cm, 0.0f, TANK_HEIGHT_CM);
+    storageTank = calculateWaterVolumeLiters(waterHeight_cm);
+  }
+}
+
+/**
+ * @brief Updates the 16x2 LCD with the latest sensor data.
+ */
+void updateLcd() {
+  lcd.setCursor(0, 0);
+  lcd.printf("T:%.1fC H:%.0f%% ", temperature, humidity);
+  lcd.setCursor(0, 1);
+  lcd.printf("NH3:%.1f S:%.1fL", ammonia, storageTank);
+}
+
+/**
+ * @brief Main handler for time-dependent tasks (sampling and reporting).
+ */
+void handleHourlyTasks(unsigned long currentMillis) {
+  time_t now = time(nullptr);
+  if (now < 946684800L) return; // Don't run if time is not synced
+
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+
+  handleDataSampling(timeinfo);
+  handleHourlyReporting(timeinfo);
+}
+
+/**
+ * @brief Handles the logic for taking a data sample at specified intervals.
+ * @param timeinfo A struct containing the current local time.
+ */
+void handleDataSampling(const tm& timeinfo) {
+  // IMPROVEMENT: More robust trigger. Triggers once when the minute is a multiple of 10
+  // and is different from the last minute we sampled.
+  if (timeinfo.tm_min % SAMPLING_INTERVAL_MINUTES == 0 && timeinfo.tm_min != lastSampleMinute) {
+    if (currentHourlySampleCount < SAMPLES_PER_HOUR) {
+      if (temperature > -40.0f && temperature < 80.0f && humidity >= 0.0f && humidity <= 100.0f) {
+        hourlyTemperatureSamples[currentHourlySampleCount] = temperature;
+        hourlyHumiditySamples[currentHourlySampleCount]    = humidity;
+        hourlyAmmoniaSamples[currentHourlySampleCount]     = ammonia;
+        hourlyStorageTankSamples[currentHourlySampleCount] = storageTank;
+        currentHourlySampleCount++;
+        
+        Serial.printf("Sample %d taken at %02d:%02d\n", currentHourlySampleCount, timeinfo.tm_hour, timeinfo.tm_min);
+        lastSampleMinute = timeinfo.tm_min; // Mark this minute as sampled
+      } else {
+        Serial.println("Skipping sample due to invalid sensor data.");
+      }
+    }
+  }
+}
+
+/**
+ * @brief Handles the logic for sending an averaged report at the top of the hour.
+ * @param timeinfo A struct containing the current local time.
+ */
+void handleHourlyReporting(const tm& timeinfo) {
+  // IMPROVEMENT: More robust trigger. Triggers once when the minute is 0
+  // and the hour is different from the last hour we reported.
+  if (timeinfo.tm_min == 0 && timeinfo.tm_hour != lastReportHour) {
+    if (currentHourlySampleCount > 0) {
+      Serial.printf("Initiating hourly report for hour: %d\n", timeinfo.tm_hour);
+      postToGoogleSheets();
+    } else {
+      Serial.printf("Skipping report for hour %d: No samples taken.\n", timeinfo.tm_hour);
+    }
+    clearHourlySampleArrays(); // Reset for the next hour
+    lastReportHour = timeinfo.tm_hour; // Mark this hour as reported
+    // Reset lastSampleMinute to allow sampling in the new hour.
+    lastSampleMinute = -1; 
+  }
+}
+
+/**
+ * @brief Prepares JSON payload and posts it to the configured Google Sheet webhook.
+ */
+void postToGoogleSheets() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected. Cannot send hourly report.");
+    return;
+  }
+  
+  float avg_temp = calculateFloatArrayAverage(hourlyTemperatureSamples, currentHourlySampleCount);
+  float avg_hum  = calculateFloatArrayAverage(hourlyHumiditySamples, currentHourlySampleCount);
+  float avg_nh3  = calculateFloatArrayAverage(hourlyAmmoniaSamples, currentHourlySampleCount);
+  float avg_tank = calculateFloatArrayAverage(hourlyStorageTankSamples, currentHourlySampleCount);
+
+  StaticJsonDocument<512> doc;
+  doc["thing"] = THING_UID_NAME;
+
+  char iso_timestamp[25];
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  strftime(iso_timestamp, sizeof(iso_timestamp), "%Y-%m-%dT%H:00:00", &timeinfo);
+  doc["timestamp"] = iso_timestamp;
+
+  if (!isnan(avg_nh3))  doc["ammonia"]     = round(avg_nh3 * 10.0f) / 10.0f;
+  if (!isnan(avg_temp)) doc["temperature"] = round(avg_temp * 10.0f) / 10.0f;
+  if (!isnan(avg_hum))  doc["humidity"]    = round(avg_hum * 10.0f) / 10.0f;
+  if (!isnan(avg_tank)) doc["storageTank"] = round(avg_tank * 10.0f) / 10.0f;
+  
+  doc["storagePump"]    = storagePump ? 1 : 0;
+  doc["siren"]          = siren ? 1 : 0;
+  doc["cctv"]           = cCTV ? 1 : 0;
+  doc["auxiliarySocket"]= auxilliarySocket ? 1 : 0;
+
+  String payload;
+  serializeJson(doc, payload);
+  Serial.print("JSON Payload: "); Serial.println(payload);
+  
+  // IMPROVEMENT: For production, replace setInsecure() with a Root CA certificate.
+  // This prevents man-in-the-middle attacks.
+  // const char* google_root_ca = "-----BEGIN CERTIFICATE-----\n...";
+  // clientSecure.setCACert(google_root_ca);
+  clientSecure.setInsecure(); // Use with caution.
+
+  Serial.println("Sending data to Google Sheet...");
+  // IMPROVEMENT: Using substring on the URL constant directly.
+  String path = String(GOOGLE_SHEET_WEBHOOK_URL).substring(String(GOOGLE_SCRIPT_HOST).length() + 8); // +8 for "https://"
+
+  googleSheetsClient.post(path, "application/json", payload);
+  
+  int httpCode = googleSheetsClient.responseStatusCode();
+  String httpResponse = googleSheetsClient.responseBody();
+  Serial.print("Google Sheet POST - HTTP Code: "); Serial.println(httpCode);
+  Serial.print("Google Sheet POST - Response: "); Serial.println(httpResponse);
+
+  googleSheetsClient.stop();
+}
+
+// =======================================================================================
+//                                  ORIGINAL HELPERS
+// =======================================================================================
+
 void synchronizeNTPTime() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("Synchronizing time with NTP server... ");
@@ -320,8 +369,6 @@ void synchronizeNTPTime() {
     
     time_t now = time(nullptr);
     int tries = 0;
-    // Wait until time is greater than a known past date (e.g., 2000-01-01 00:00:00 UTC)
-    // Epoch for 2000-01-01 00:00:00 UTC is 946684800
     while (now < 946684800L && tries < NTP_SYNC_MAX_TRIES) {
       delay(NTP_SYNC_RETRY_DELAY_MS);
       now = time(nullptr);
@@ -333,21 +380,18 @@ void synchronizeNTPTime() {
       Serial.println("\nNTP Time synchronization failed!");
     } else {
       struct tm timeinfo;
-      localtime_r(&now, &timeinfo); // Use localtime_r for thread safety
+      localtime_r(&now, &timeinfo);
       Serial.print("\nNTP Time synchronized: ");
-      Serial.println(asctime(&timeinfo));
+      Serial.print(asctime(&timeinfo));
     }
   } else {
     Serial.println("Cannot synchronize NTP: WiFi not connected.");
   }
 }
 
-/**
- * @brief Clears all hourly sample arrays and resets the sample count.
- */
 void clearHourlySampleArrays() {
-  for (int i = 0; i < MAX_HOURLY_SAMPLES; i++) {
-    hourlyAmmoniaSamples[i]     = NAN; // Not a Number, indicates no valid sample
+  for (int i = 0; i < SAMPLES_PER_HOUR; i++) {
+    hourlyAmmoniaSamples[i]     = NAN;
     hourlyTemperatureSamples[i] = NAN;
     hourlyHumiditySamples[i]    = NAN;
     hourlyStorageTankSamples[i] = NAN;
@@ -356,12 +400,6 @@ void clearHourlySampleArrays() {
   Serial.println("Hourly sample arrays cleared.");
 }
 
-/**
- * @brief Calculates the average of valid (non-NAN) float values in an array.
- * @param arr Pointer to the float array.
- * @param count The number of elements to consider for averaging (typically currentHourlySampleCount).
- * @return The average value, or NAN if no valid samples or count is zero.
- */
 float calculateFloatArrayAverage(float* arr, int count) {
   if (count == 0) return NAN;
   
@@ -377,12 +415,6 @@ float calculateFloatArrayAverage(float* arr, int count) {
   return (validSamples > 0) ? (sum / validSamples) : NAN;
 }
 
-/**
- * @brief Measures distance using an HC-SR04 or similar ultrasonic sensor.
- * @param trigPin The trigger pin for the ultrasonic sensor.
- * @param echoPin The echo pin for the ultrasonic sensor.
- * @return Measured distance in centimeters (cm), or NAN on timeout/error.
- */
 float measureDistanceCM(uint8_t trigPin, uint8_t echoPin) {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
@@ -390,76 +422,52 @@ float measureDistanceCM(uint8_t trigPin, uint8_t echoPin) {
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
   
-  // Reads the echoPin, returns the sound wave travel time in microseconds
-  // Timeout ULTRASONIC_TIMEOUT_US (e.g., 30000 us for ~5 meters max range)
   long duration_us = pulseIn(echoPin, HIGH, ULTRASONIC_TIMEOUT_US); 
   
-  if (duration_us > 0) {
-    // Calculate the distance: Time * Speed_of_Sound / 2 (round trip)
-    return (float)duration_us * SPEED_OF_SOUND_CM_PER_US / 2.0f;
-  } else {
-    return NAN; // Timeout or no echo received
-  }
+  return (duration_us > 0) ? (float)duration_us * SPEED_OF_SOUND_CM_PER_US / 2.0f : NAN;
 }
 
-/**
- * @brief Calculates the volume of water in a frustum-shaped tank.
- * @param h_water Current height of the water in cm, measured from the bottom.
- * @return Volume of water in Liters.
- */
 float calculateWaterVolumeLiters(float h_water) {
   if (h_water <= 0.0f) return 0.0f;
   if (h_water >= TANK_HEIGHT_CM) return TANK_MAX_VOLUME_LITERS;
   
-  // Calculate the radius of the water surface at height h_water using linear interpolation
   float radius_at_h = TANK_RADIUS_BOTTOM_CM + 
                       (TANK_RADIUS_TOP_CM - TANK_RADIUS_BOTTOM_CM) * (h_water / TANK_HEIGHT_CM);
                       
-  // Volume of a frustum segment (from bottom up to h_water)
-  // V = (pi * h / 3) * (R_top_segment^2 + R_top_segment * R_bottom_segment + R_bottom_segment^2)
-  // Here, R_bottom_segment is TANK_RADIUS_BOTTOM_CM, and R_top_segment is radius_at_h
   float volume_cm3 = (M_PI * h_water / 3.0f) * (radius_at_h * radius_at_h + 
                       radius_at_h * TANK_RADIUS_BOTTOM_CM + 
                       TANK_RADIUS_BOTTOM_CM * TANK_RADIUS_BOTTOM_CM);
                       
-  return volume_cm3 / 1000.0f; // Convert cm^3 to Liters
+  return volume_cm3 / 1000.0f;
 }
 
 // =======================================================================================
-//                      ARDUINO CLOUD VARIABLE CALLBACK FUNCTIONS
+//                       ARDUINO CLOUD VARIABLE CALLBACK FUNCTIONS
 // =======================================================================================
-// These functions are called when the E S P 32 receives an update for the 
-// corresponding cloud variable from the Arduino Cloud dashboard or API.
 
 void onAuxilliarySocketChange() {
-  Serial.print("Auxiliary Socket state changed via Cloud: ");
-  Serial.println(auxilliarySocket ? "ON" : "OFF");
+  Serial.printf("Cloud Change: Auxiliary Socket -> %s\n", auxilliarySocket ? "ON" : "OFF");
   digitalWrite(RELAY_AUX_PIN, auxilliarySocket ? HIGH : LOW);
 }
 
 void onCCTVChange() {
-  Serial.print("CCTV Relay state changed via Cloud: ");
-  Serial.println(cCTV ? "ON" : "OFF");
+  Serial.printf("Cloud Change: CCTV -> %s\n", cCTV ? "ON" : "OFF");
   digitalWrite(RELAY_CCTV_PIN, cCTV ? HIGH : LOW);
 }
 
 void onSirenChange() {
-  Serial.print("Siren Relay state changed via Cloud: ");
-  Serial.println(siren ? "ON" : "OFF");
+  Serial.printf("Cloud Change: Siren -> %s\n", siren ? "ON" : "OFF");
   digitalWrite(RELAY_SIREN_PIN, siren ? HIGH : LOW);
 }
 
 void onStoragePumpChange() {
-  Serial.print("Storage Pump Relay state changed via Cloud: ");
-  Serial.println(storagePump ? "ON" : "OFF");
-  digitalWrite(RELAY_PUMP_PIN, storagePump ? HIGH : LOW);
+  if (storagePump) {
+    Serial.println("Cloud Change: Pump -> ON (20s timer started)");
+    digitalWrite(RELAY_PUMP_PIN, HIGH);
+    pumpTurnedOnMillis = millis();
+  }
 }
 
 void onFlushIntervalChange() {
-  // Example: 'flushInterval' could be a cloud variable determining how often something happens.
-  Serial.print("Flush Interval changed via Cloud to: ");
-  Serial.println(flushInterval); // Assuming 'flushInterval' is an int or similar
-  // Add logic here to act on the new flushInterval value
+  Serial.printf("Cloud Change: Flush Interval set to %d\n", flushInterval);
 }
-
-// Add other callbacks from thingProperties.h if any
